@@ -26,6 +26,11 @@ function clampChannel(value) {
   return Math.max(0, Math.min(255, value));
 }
 
+function getPixelBrightness(red, green, blue) {
+  // 使用人眼感知权重计算亮度，比简单 RGB 平均值更接近视觉效果。
+  return red * 0.299 + green * 0.587 + blue * 0.114;
+}
+
 function processPixels(imageData, settings) {
   const data = imageData.data;
   const contrastFactor =
@@ -37,7 +42,7 @@ function processPixels(imageData, settings) {
     let blue = data[index + 2];
 
     if (settings.grayscale) {
-      const gray = red * 0.299 + green * 0.587 + blue * 0.114;
+      const gray = getPixelBrightness(red, green, blue);
       red = gray;
       green = gray;
       blue = gray;
@@ -61,6 +66,110 @@ function processPixels(imageData, settings) {
   return imageData;
 }
 
+function calculateImageStats(imageData) {
+  const data = imageData.data;
+  const histogramBucketCount = 16;
+  const histogram = Array.from({ length: histogramBucketCount }, () => 0);
+  const pixelCount = data.length / 4;
+
+  let brightnessSum = 0;
+  let minBrightness = 255;
+  let maxBrightness = 0;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const red = data[index];
+    const green = data[index + 1];
+    const blue = data[index + 2];
+    const brightness = getPixelBrightness(red, green, blue);
+    const roundedBrightness = Math.round(brightness);
+
+    brightnessSum += brightness;
+    minBrightness = Math.min(minBrightness, roundedBrightness);
+    maxBrightness = Math.max(maxBrightness, roundedBrightness);
+
+    // 把 0-255 的亮度分成 16 段，用于绘制轻量直方图。
+    const bucketIndex = Math.min(
+      histogramBucketCount - 1,
+      Math.floor((roundedBrightness / 256) * histogramBucketCount),
+    );
+    histogram[bucketIndex] += 1;
+  }
+
+  const averageBrightness = pixelCount > 0 ? brightnessSum / pixelCount : 0;
+  const histogramMax = Math.max(...histogram, 1);
+
+  return {
+    averageBrightness: Math.round(averageBrightness),
+    minBrightness,
+    maxBrightness,
+    pixelCount,
+    dynamicRange: maxBrightness - minBrightness,
+    histogram: histogram.map((value, index) => ({
+      label: `${index * 16}-${index === histogramBucketCount - 1 ? 255 : index * 16 + 15}`,
+      value,
+      percent: Math.round((value / histogramMax) * 100),
+    })),
+  };
+}
+
+function ImageStatsPanel({ stats, hasImage }) {
+  if (!hasImage) {
+    return (
+      <section className="stats-panel" aria-label="图像统计分析">
+        <div className="stats-heading">
+          <span>像素分析</span>
+          <strong>等待图片</strong>
+        </div>
+        <p className="stats-empty">上传图片后会自动计算亮度、明暗范围和直方图。</p>
+      </section>
+    );
+  }
+
+  if (!stats) {
+    return null;
+  }
+
+  return (
+    <section className="stats-panel" aria-label="图像统计分析">
+      <div className="stats-heading">
+        <span>像素分析</span>
+        <strong>{stats.pixelCount.toLocaleString()} px</strong>
+      </div>
+
+      <div className="stats-grid">
+        <div className="stat-card">
+          <span>平均亮度</span>
+          <strong>{stats.averageBrightness}</strong>
+        </div>
+        <div className="stat-card">
+          <span>最暗像素</span>
+          <strong>{stats.minBrightness}</strong>
+        </div>
+        <div className="stat-card">
+          <span>最亮像素</span>
+          <strong>{stats.maxBrightness}</strong>
+        </div>
+        <div className="stat-card">
+          <span>动态范围</span>
+          <strong>{stats.dynamicRange}</strong>
+        </div>
+      </div>
+
+      <div className="histogram" aria-label="亮度直方图">
+        {stats.histogram.map((bucket) => (
+          <span
+            aria-label={`亮度 ${bucket.label}: ${bucket.value} 个像素`}
+            className="histogram-bar"
+            key={bucket.label}
+            style={{ height: `${Math.max(bucket.percent, 4)}%` }}
+            title={`亮度 ${bucket.label}: ${bucket.value} 个像素`}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function App() {
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
@@ -69,12 +178,13 @@ export default function App() {
   const [hasImage, setHasImage] = useState(false);
   const [settings, setSettings] = useState(defaultSettings);
   const [viewMode, setViewMode] = useState('effect');
+  const [imageStats, setImageStats] = useState(null);
 
   const renderCanvas = useCallback((canvas, shouldProcess) => {
     const image = imageRef.current;
 
     if (!canvas || !image) {
-      return;
+      return null;
     }
 
     const context = canvas.getContext('2d', { willReadFrequently: true });
@@ -88,19 +198,26 @@ export default function App() {
     context.clearRect(0, 0, width, height);
     context.drawImage(image, 0, 0, width, height);
 
+    let imageData = context.getImageData(0, 0, width, height);
+
     if (shouldProcess) {
-      const imageData = context.getImageData(0, 0, width, height);
-      context.putImageData(processPixels(imageData, settings), 0, 0);
+      imageData = processPixels(imageData, settings);
+      context.putImageData(imageData, 0, 0);
     }
+
+    return calculateImageStats(imageData);
   }, [settings]);
 
   const drawImage = useCallback(() => {
-    renderCanvas(canvasRef.current, viewMode === 'effect');
+    const nextStats = renderCanvas(canvasRef.current, viewMode === 'effect');
+    setImageStats(nextStats);
   }, [renderCanvas, viewMode]);
 
   useEffect(() => {
     if (hasImage) {
       drawImage();
+    } else {
+      setImageStats(null);
     }
   }, [drawImage, hasImage]);
 
@@ -337,6 +454,8 @@ export default function App() {
             <span>反色</span>
           </label>
         </div>
+
+        <ImageStatsPanel hasImage={hasImage} stats={imageStats} />
 
         <div className="action-grid">
           <button disabled={!hasImage} onClick={resetImage} type="button">
